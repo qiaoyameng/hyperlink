@@ -3,6 +3,14 @@
 ## Next
 
 * CPython 3.9 added to test matrix
+* Added `URL.safe_display()` (also on `DecodedURL`), a diagnostic
+  rendering that omits userinfo, masks sensitive query values
+  (case-insensitive, after percent-decoding each key, repeated keys
+  included), redacts undecodable query data, optionally recurses into
+  nested URL query parameters with depth and length limits, and marks
+  truncation explicitly. `repr()` and `URLParseError` messages now
+  follow the same masking boundary, so logs and tracebacks no longer
+  contain credentials or access tokens.
 
 ## 21.0.0
 

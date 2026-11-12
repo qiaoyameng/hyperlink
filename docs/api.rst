@@ -58,6 +58,24 @@ it into other URLs and text.
 .. automethod:: hyperlink.URL.replace
 .. automethod:: hyperlink.URL.normalize
 
+Safe Display
+------------
+
+When a URL needs to appear in logs or other diagnostics, use
+:meth:`~hyperlink.URL.safe_display` (also available on
+:class:`~hyperlink.DecodedURL`). It renders the URL without userinfo
+and with sensitive query values masked, so secrets never reach log
+files. The URL object itself is never modified.
+
+.. automethod:: hyperlink.URL.safe_display
+.. automethod:: hyperlink.DecodedURL.safe_display
+
+The masking policy is controlled by these module-level constants:
+
+.. autodata:: hyperlink.DEFAULT_SENSITIVE_QUERY_KEYS
+.. autodata:: hyperlink.REDACTION_PLACEHOLDER
+.. autodata:: hyperlink.TRUNCATION_MARKER
+
 Navigation
 ----------
 

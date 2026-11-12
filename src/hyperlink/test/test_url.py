@@ -264,9 +264,9 @@ class TestURL(HyperlinkTestCase):
     def test_repr(self):
         # type: () -> None
         """
-        L{URL.__repr__} will display the canonical form of the URL, wrapped in
-        a L{URL.from_text} invocation, so that it is C{eval}-able but still
-        easy to read.
+        L{URL.__repr__} wraps the safe display form of the URL in a
+        L{URL.from_text} invocation. For URLs without secrets it is still
+        C{eval}-able and easy to read; sensitive URLs are masked.
         """
         self.assertEqual(
             repr(

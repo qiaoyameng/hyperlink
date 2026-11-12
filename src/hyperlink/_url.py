@@ -912,6 +912,351 @@ def parse_host(host):
     return family, host
 
 
+#: Placeholder substituted for any value that safe_display() must not
+#: reveal. It intentionally looks like a marker, not a real value.
+REDACTION_PLACEHOLDER = u"REDACTED"
+
+#: Explicit suffix on truncated safe_display() output, so a clipped URL
+#: can never be mistaken for a complete, usable address.
+TRUNCATION_MARKER = u"...[TRUNCATED]"
+
+#: Upper bound on the length of a safe_display() rendering, including the
+#: truncation marker.
+SAFE_DISPLAY_MAX_LENGTH = 2048
+
+#: Maximum number of nested URL parameters that safe_display() will
+#: descend into, regardless of the caller-requested depth.
+SAFE_DISPLAY_MAX_RECURSION_DEPTH = 3
+
+#: Query parameter names whose values are never included in
+#: safe_display() output. Matching is case-insensitive and applied after
+#: each key has been percent-decoded.
+DEFAULT_SENSITIVE_QUERY_KEYS = frozenset(
+    [
+        u"access_token",
+        u"api_key",
+        u"apikey",
+        u"auth",
+        u"authorization",
+        u"password",
+        u"passwd",
+        u"refresh_token",
+        u"secret",
+        u"token",
+    ]
+)
+
+#: Matches percent signs that do not begin a valid percent-encoding
+#: triplet, e.g. "%", "%z", "%z1", "%1".
+_STRAY_PERCENT_RE = re.compile(u"%(?![0-9A-Fa-f]{2})")
+
+
+def _decode_safe_text(text, decode_map):
+    # type: (Text, Mapping[bytes, bytes]) -> Optional[Text]
+    """Decode a structural URL field for display.
+
+    Returns None when the text cannot be safely decoded, so that
+    undecodable raw data (stray percent signs or invalid UTF-8) never
+    has to be rendered into diagnostic output.
+    """
+    if _STRAY_PERCENT_RE.search(text):
+        return None
+    try:
+        return _percent_decode(
+            text, raise_subencoding_exc=True, _decode_map=decode_map
+        )
+    except UnicodeDecodeError:
+        return None
+
+
+def _is_sensitive_query_key(key, sensitive_keys):
+    # type: (Text, Iterable[Text]) -> bool
+    """Whether *key* is sensitive, using the documented rules.
+
+    The key is first percent-decoded. Matching then compares
+    case-insensitively against *sensitive_keys*, so percent-encoding
+    (``%61ccess_token``) and letter case (``Access_Token``) cannot be
+    used to dodge the policy. Undecodable keys are treated as
+    sensitive.
+    """
+    decoded = _decode_safe_text(key, _QUERY_KEY_DECODE_MAP)
+    if decoded is None:
+        return True
+    folded = decoded.lower()
+    for sensitive_key in sensitive_keys:
+        if folded == sensitive_key.lower():
+            return True
+    return False
+
+
+def _render_safe_query_value(value):
+    # type: (Text) -> Text
+    """Render a non-sensitive query value for display.
+
+    Values are decoded and maximally re-encoded, so a value containing
+    encoded delimiters can never break out of its query position, and
+    literal percent signs cannot re-enter the output as stray escapes.
+    Values that cannot be decoded are masked.
+    """
+    decoded = _decode_safe_text(value, _QUERY_VALUE_DECODE_MAP)
+    if decoded is None:
+        return REDACTION_PLACEHOLDER
+    return _encode_query_value(decoded, maximal=True)
+
+
+def _render_safe_query_key(key):
+    # type: (Text) -> Text
+    """Render a decoded query key for display, always quoting percents."""
+    return _encode_query_key(key, maximal=True)
+
+
+def _safe_display_authority(url):
+    # type: (URL) -> Text
+    """Render the authority for safe display.
+
+    No userinfo is emitted at all: usernames are not secrets, but the
+    entire userinfo component is omitted so neither credentials nor
+    their structure can leak. Host and port are never sensitive.
+    """
+    host = url.host
+    if u":" in host:
+        hostport = u"[" + host + u"]"
+    else:
+        hostport = host
+    if url.port != SCHEME_PORT_MAP.get(url.scheme):
+        hostport = hostport + u":" + Text(url.port)
+    if url.userinfo:
+        return hostport
+    return url.authority(with_password=False)
+
+
+def _safe_query_pairs(url, sensitive_keys, recurse, max_depth, budget):
+    # type: (URL, Iterable[Text], bool, int, int) -> Optional[List[Text]]
+    """Render all query pairs for safe display, in their original order.
+
+    Repeated keys are all handled independently. Returns None when the
+    rendering would exceed the caller's length *budget*; the caller then
+    truncates the whole URL rather than emitting a partial query string.
+    """
+    rendered = []  # type: List[Text]
+    total = 0
+    for key, value in url.query:
+        rendered_key = _decode_safe_text(key, _QUERY_KEY_DECODE_MAP)
+        if rendered_key is None:
+            encoded_key = REDACTION_PLACEHOLDER
+        else:
+            encoded_key = _render_safe_query_key(rendered_key)
+        if value is None:
+            pair = encoded_key
+        elif _is_sensitive_query_key(key, sensitive_keys):
+            pair = encoded_key + u"=" + REDACTION_PLACEHOLDER
+        else:
+            nested = None
+            if recurse:
+                nested = _safe_nested_query_value(
+                    value, sensitive_keys, max_depth - 1
+                )
+            if nested is None:
+                nested = _render_safe_query_value(value)
+            pair = encoded_key + u"=" + nested
+        total += len(pair) + (1 if rendered else 0)  # "&" separators
+        rendered.append(pair)
+        if total > budget:
+            return None
+    return rendered
+
+
+def _parse_nested_url(value):
+    # type: (Text) -> Optional[URL]
+    """Return *value* as a :class:`URL` only if it is a complete URL.
+
+    A relative or plain-text value is never guessed at: it must parse
+    with both a scheme and a host to be considered a nested URL.
+    Undecodable values also return None.
+    """
+    decoded = _decode_safe_text(value, _QUERY_VALUE_DECODE_MAP)
+    if decoded is None:
+        return None
+    try:
+        nested_url = URL.from_text(decoded)
+    except (URLParseError, ValueError):
+        # URLParseError covers bad ports/hosts; ValueError covers an
+        # invalid scheme, which can occur in ordinary prose text.
+        return None
+    if not nested_url.scheme or not nested_url.host:
+        return None
+    return nested_url
+
+
+def _safe_nested_query_value(value, sensitive_keys, remaining_depth):
+    # type: (Text, Iterable[Text], int) -> Optional[Text]
+    """Render a query value that is declared to contain a nested URL.
+
+    Only values that parse as complete URLs are treated as URLs; plain
+    text that merely resembles a URL is left alone. When the depth
+    budget is exhausted, a value that really is a complete URL is
+    masked instead of rendered, so deeper secrets cannot leak simply by
+    being nested beyond the limit. Returns None when the value is not a
+    nested URL.
+    """
+    nested_url = _parse_nested_url(value)
+    if nested_url is None:
+        if _decode_safe_text(value, _QUERY_VALUE_DECODE_MAP) is None:
+            return REDACTION_PLACEHOLDER
+        return None
+    if remaining_depth <= 0:
+        return REDACTION_PLACEHOLDER
+    return _safe_display_impl(
+        nested_url,
+        sensitive_keys=sensitive_keys,
+        recurse=True,
+        max_depth=remaining_depth,
+        max_length=SAFE_DISPLAY_MAX_LENGTH,
+        truncate=False,
+    )
+
+
+def _safe_loose_text(text, sensitive_keys):
+    # type: (Text, Iterable[Text]) -> Text
+    """Mask arbitrary URL-ish text for inclusion in error messages.
+
+    Works directly on the raw text (rather than a parsed :class:`URL`)
+    so it can also handle strings that fail to fully parse. Applies the
+    same boundaries as :meth:`URL.safe_display`: userinfo is dropped,
+    sensitive and undecodable query entries are masked, and the result
+    never contains the original secrets.
+    """
+    match = _URL_RE.match(text)
+    if match is None:
+        return REDACTION_PLACEHOLDER
+    groups = match.groupdict()
+
+    parts = []  # type: List[Text]
+    if groups["scheme"]:
+        parts.append(groups["scheme"])
+        parts.append(u":")
+    if groups["_netloc_sep"]:
+        parts.append(u"//")
+    authority = groups["authority"] or u""
+    if u"@" in authority:
+        authority = authority.rsplit(u"@", 1)[1]
+    parts.append(authority)
+    parts.append(groups["path"] or u"")
+
+    raw_query = groups["query"]
+    if raw_query is not None:
+        safe_pairs = []  # type: List[Text]
+        for entry in raw_query.split(u"&"):
+            if u"=" in entry:
+                key, value = entry.split(u"=", 1)
+            else:
+                key, value = entry, None
+            if _decode_safe_text(key, _QUERY_KEY_DECODE_MAP) is None:
+                safe_key = REDACTION_PLACEHOLDER
+            else:
+                safe_key = key
+            if value is None:
+                safe_pairs.append(safe_key)
+            elif _is_sensitive_query_key(key, sensitive_keys):
+                safe_pairs.append(safe_key + u"=" + REDACTION_PLACEHOLDER)
+            elif _decode_safe_text(value, _QUERY_VALUE_DECODE_MAP) is None:
+                safe_pairs.append(safe_key + u"=" + REDACTION_PLACEHOLDER)
+            else:
+                nested_url = _parse_nested_url(value)
+                if nested_url is not None:
+                    value = _safe_display_impl(
+                        nested_url,
+                        sensitive_keys=sensitive_keys,
+                        recurse=True,
+                        max_depth=SAFE_DISPLAY_MAX_RECURSION_DEPTH,
+                        truncate=False,
+                    )
+                safe_pairs.append(safe_key + u"=" + value)
+        parts.append(u"?")
+        parts.append(u"&".join(safe_pairs))
+
+    if groups["fragment"] is not None:
+        parts.append(u"#")
+        parts.append(groups["fragment"])
+    return u"".join(parts)
+
+
+def _safe_display_impl(
+    url,
+    sensitive_keys=DEFAULT_SENSITIVE_QUERY_KEYS,
+    recurse=False,
+    max_depth=0,
+    max_length=SAFE_DISPLAY_MAX_LENGTH,
+    truncate=True,
+):
+    # type: (URL, Iterable[Text], bool, int, int, bool) -> Text
+    """Shared implementation backing URL.safe_display()."""
+    if max_depth < 0:
+        raise ValueError(
+            "max_depth must be non-negative, not %r" % (max_depth,)
+        )
+    if max_depth > SAFE_DISPLAY_MAX_RECURSION_DEPTH:
+        max_depth = SAFE_DISPLAY_MAX_RECURSION_DEPTH
+    if max_length <= len(TRUNCATION_MARKER):
+        raise ValueError(
+            "max_length must be greater than the truncation marker length"
+        )
+
+    scheme = url.scheme
+    authority = _safe_display_authority(url)
+    path = u"/".join(
+        _encode_path_parts(
+            url.path,
+            rooted=url.rooted,
+            has_scheme=bool(scheme),
+            has_authority=bool(authority),
+            maximal=False,
+        )
+    )
+
+    parts = []  # type: List[Text]
+    if scheme:
+        parts.append(scheme)
+        parts.append(u":")
+    if authority:
+        parts.append(u"//")
+        parts.append(authority)
+    elif scheme and path[:2] != "//" and url.uses_netloc:
+        parts.append(u"//")
+    if path:
+        if scheme and authority and path[:1] != "/":
+            parts.append(u"/")
+        parts.append(path)
+
+    dropped_query = False
+    if url.query:
+        base_length = sum(len(part) for part in parts)
+        query_budget = max_length - base_length - 1  # the "?" separator
+        query_parts = _safe_query_pairs(
+            url,
+            sensitive_keys,
+            recurse=recurse,
+            max_depth=max_depth,
+            budget=query_budget,
+        )
+        if query_parts is None:
+            dropped_query = True
+        else:
+            parts.append(u"?")
+            parts.append(u"&".join(query_parts))
+
+    fragment = url.fragment
+    if fragment:
+        parts.append(u"#")
+        parts.append(fragment)
+
+    rendered = u"".join(parts)
+    if dropped_query or (truncate and len(rendered) > max_length):
+        keep = max_length - len(TRUNCATION_MARKER)
+        return rendered[:keep] + TRUNCATION_MARKER
+    return rendered
+
+
 class URL(object):
     r"""From blogs to billboards, URLs are so common, that it's easy to
     overlook their complexity and power. With hyperlink's
@@ -1387,19 +1732,27 @@ class URL(object):
         """
         um = _URL_RE.match(_textcheck("text", text))
         if um is None:
-            raise URLParseError("could not parse url: %r" % text)
+            raise URLParseError(
+                "could not parse url: %r" % REDACTION_PLACEHOLDER
+            )
         gs = um.groupdict()
+        # Error messages may end up in logs, so they only ever contain
+        # text that has passed through the same masking rules as
+        # safe_display(): no userinfo, no sensitive query values, and no
+        # undecodable raw data.
+        safe_text = _safe_loose_text(text, DEFAULT_SENSITIVE_QUERY_KEYS)
 
         au_text = gs["authority"] or u""
+        safe_au_text = au_text.rsplit(u"@", 1)[-1]
         au_m = _AUTHORITY_RE.match(au_text)
         if au_m is None:
             raise URLParseError(
-                "invalid authority %r in url: %r" % (au_text, text)
+                "invalid authority %r in url: %r" % (safe_au_text, safe_text)
             )
         au_gs = au_m.groupdict()
         if au_gs["bad_host"]:
             raise URLParseError(
-                "invalid host %r in url: %r" % (au_gs["bad_host"], text)
+                "invalid host %r in url: %r" % (au_gs["bad_host"], safe_text)
             )
 
         userinfo = au_gs["userinfo"] or u""
@@ -1411,8 +1764,12 @@ class URL(object):
                 port = int(port)  # type: ignore[assignment] # FIXME, see below
             except ValueError:
                 if not port:  # TODO: excessive?
-                    raise URLParseError("port must not be empty: %r" % au_text)
-                raise URLParseError("expected integer for port, not %r" % port)
+                    raise URLParseError(
+                        "port must not be empty: %r" % safe_au_text
+                    )
+                raise URLParseError(
+                    "expected integer for port, not %r" % port
+                )
 
         scheme = gs["scheme"] or u""
         fragment = gs["fragment"] or u""
@@ -1809,13 +2166,79 @@ class URL(object):
             _add(fragment)
         return u"".join(parts)
 
+    def safe_display(
+        self,
+        sensitive_query_keys=DEFAULT_SENSITIVE_QUERY_KEYS,
+        recurse_nested=False,
+        max_depth=SAFE_DISPLAY_MAX_RECURSION_DEPTH,
+        max_length=SAFE_DISPLAY_MAX_LENGTH,
+    ):
+        # type: (Iterable[Text], bool, int, int) -> Text
+        """Render this URL for safe inclusion in logs and diagnostics.
+
+        Unlike :meth:`to_text`, this is a display-only view: the URL
+        object itself, and any bytes sent over the wire, are never
+        modified. The output applies these masking rules:
+
+        - The entire userinfo component (username *and* password) is
+          omitted, so neither credentials nor access tokens embedded in
+          the authority can appear.
+        - Query values whose keys are sensitive are replaced with the
+          placeholder ``"REDACTED"``. Every occurrence of a repeated key
+          is handled. Keys are percent-decoded before a
+          case-insensitive comparison, so encoding and letter case
+          cannot bypass the policy; see
+          :data:`DEFAULT_SENSITIVE_QUERY_KEYS`.
+        - Non-sensitive values are decoded and re-encoded, so encoded
+          delimiters cannot break out of their query position. Values
+          containing stray percent signs or otherwise undecodable data
+          are redacted instead of being surfaced.
+        - Plain text query values are never guessed at: a value is only
+          treated as a nested URL when *recurse_nested* is true and the
+          value parses as a complete URL with a scheme and host. Nested
+          URLs are masked with the same rules, down to *max_depth*
+          levels, and the total render length is capped at *max_length*.
+        - When the rendering exceeds *max_length*, it is cut and given
+          the explicit ``"...[TRUNCATED]"`` suffix, so a clipped URL can
+          never look like a complete, usable address.
+
+        Args:
+            sensitive_query_keys: Query parameter names to mask, compared
+                case-insensitively after percent-decoding each key.
+            recurse_nested: Whether query values that are complete URLs
+                should themselves be rendered through this method.
+            max_depth: Maximum nesting depth for recursively rendered URL
+                parameters. Capped at
+                :data:`SAFE_DISPLAY_MAX_RECURSION_DEPTH`.
+            max_length: Maximum length of the returned text, including
+                any truncation marker.
+
+        Returns:
+            Text: A diagnostic rendering that contains no userinfo, no
+                sensitive query values, and no undecodable raw data.
+        """  # noqa: E501
+        return _safe_display_impl(
+            self,
+            sensitive_keys=sensitive_query_keys,
+            recurse=recurse_nested,
+            max_depth=max_depth,
+            max_length=max_length,
+        )
+
     def __repr__(self):
         # type: () -> str
-        """Convert this URL to an representation that shows all of its
-        constituent parts, as well as being a valid argument to
-        :func:`eval`.
+        """Convert this URL to an representation suitable for logs.
+
+        The rendering goes through :meth:`safe_display` (including
+        recursive masking of nested URL parameters), so the repr never
+        contains userinfo or sensitive query values. It is
+        diagnostic-only and not guaranteed to round-trip through
+        :meth:`from_text`; use :meth:`to_text` for the full URL text.
         """
-        return "%s.from_text(%r)" % (self.__class__.__name__, self.to_text())
+        return "%s.from_text(%r)" % (
+            self.__class__.__name__,
+            self.safe_display(recurse_nested=True),
+        )
 
     def _to_bytes(self):
         # type: () -> bytes
@@ -2078,6 +2501,27 @@ class DecodedURL(object):
         # type: (bool) -> Text
         "Passthrough to :meth:`~hyperlink.URL.to_text()`"
         return self._url.to_text(with_password)
+
+    def safe_display(
+        self,
+        sensitive_query_keys=DEFAULT_SENSITIVE_QUERY_KEYS,
+        recurse_nested=False,
+        max_depth=SAFE_DISPLAY_MAX_RECURSION_DEPTH,
+        max_length=SAFE_DISPLAY_MAX_LENGTH,
+    ):
+        # type: (Iterable[Text], bool, int, int) -> Text
+        """Passthrough to :meth:`~hyperlink.URL.safe_display()`.
+
+        The masking operates on the underlying encoded URL, so it never
+        triggers decoding errors and never changes the data held by this
+        object.
+        """
+        return self._url.safe_display(
+            sensitive_query_keys=sensitive_query_keys,
+            recurse_nested=recurse_nested,
+            max_depth=max_depth,
+            max_length=max_length,
+        )
 
     def to_uri(self):
         # type: () -> URL

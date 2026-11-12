@@ -5,6 +5,9 @@ from ._url import (
     EncodedURL,
     DecodedURL,
     URLParseError,
+    DEFAULT_SENSITIVE_QUERY_KEYS,
+    REDACTION_PLACEHOLDER,
+    TRUNCATION_MARKER,
 )
 
 __all__ = (
@@ -14,4 +17,7 @@ __all__ = (
     "EncodedURL",
     "DecodedURL",
     "URLParseError",
+    "DEFAULT_SENSITIVE_QUERY_KEYS",
+    "REDACTION_PLACEHOLDER",
+    "TRUNCATION_MARKER",
 )
