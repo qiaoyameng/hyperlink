@@ -3,6 +3,10 @@
 ## Next
 
 * CPython 3.9 added to test matrix
+* `URL.to_uri()` no longer passes IPv4/IPv6 address literals through
+  IDNA, which previously raised `idna.InvalidCodepoint` for IPv6 hosts.
+* Added a fixed URI/IRI compatibility regression suite covering parsing,
+  `click`, `normalize`, and `to_uri`/`to_iri` round-trips.
 
 ## 21.0.0
 

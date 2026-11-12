@@ -1491,6 +1491,13 @@ class URL(object):
         >>> print(url.normalize().to_text())
         http://example.com/b/c%2F?a%25
 
+        .. note::
+
+            Empty path segments produced by repeated slashes (``//``) are
+            preserved. The host is only lowercased; any percent-encoding in
+            the host is left in place (with hex digits lowercased), because
+            a percent-encoded host is not a valid reg-name.
+
         .. _RFC 3986 3.2.2: https://tools.ietf.org/html/rfc3986#section-3.2.2
         .. _RFC 3986 2.3: https://tools.ietf.org/html/rfc3986#section-2.3
         .. _RFC 3986 2.1: https://tools.ietf.org/html/rfc3986#section-2.1
@@ -1601,6 +1608,13 @@ class URL(object):
         Return:
             A copy of the current URL with navigation logic applied.
 
+        .. note::
+
+            Because an empty query parses to no parameters, a bare ``?``
+            reference keeps the base query, while a bare ``#`` reference
+            clears the fragment. An empty *href* is a full self-reference,
+            preserving query and fragment.
+
         For more information, see `RFC 3986 section 5`_.
 
         .. _RFC 3986 section 5: https://tools.ietf.org/html/rfc3986#section-5
@@ -1660,6 +1674,13 @@ class URL(object):
             URL: A new instance with its path segments, query parameters, and
                 hostname encoded, so that they are all in the standard
                 US-ASCII range.
+
+        .. note::
+
+            IP address literals (IPv4 and IPv6) are already ASCII and are
+            left unchanged, not passed through IDNA. A host containing a
+            percent-encoded ``%`` is not a valid reg-name and causes
+            :class:`idna.IDNAError` to be raised rather than guessed at.
         """
         new_userinfo = u":".join(
             [_encode_userinfo_part(p) for p in self.userinfo.split(":", 1)]
@@ -1667,9 +1688,13 @@ class URL(object):
         new_path = _encode_path_parts(
             self.path, has_scheme=bool(self.scheme), rooted=False, maximal=True
         )
+        # IP literals (detected by parse_host) are already ASCII and must
+        # not be IDNA-encoded; IPv6 literals contain colons, which IDNA
+        # rejects outright.
+        host_family, _ = parse_host(self.host)
         new_host = (
             self.host
-            if not self.host
+            if not self.host or host_family is not None
             else idna_encode(self.host, uts46=True).decode("ascii")
         )
         return self.replace(
@@ -1709,6 +1734,16 @@ class URL(object):
             the in those cases, this method will return a best-effort,
             partially-decoded, URL which is still valid. This issue
             does not affect any Python builds 3.4+.
+
+        .. note::
+
+            Only percent-escapes that are safe in their containing field
+            are decoded. Escapes of structural delimiters (e.g. ``%2F`` in
+            a path, ``%23`` in a fragment) stay encoded, while escapes of
+            reserved characters that are legal there (e.g. ``%3B`` in a
+            path) are decoded. Consequently ``to_iri().to_uri()`` is not
+            guaranteed to reproduce the input bytes, though it denotes the
+            same result.
 
         Returns:
             URL: A new instance with its path segments, query parameters, and
@@ -1757,6 +1792,13 @@ class URL(object):
 
         The natural counterpart to :class:`URL.from_text()`.
 
+        .. note::
+
+            The ``?`` and ``#`` delimiters are only rendered when there is
+            query or fragment content. A trailing ``?`` or ``#`` (an empty
+            query/fragment) therefore cannot be distinguished from an absent
+            one in the rendered text; both appear as empty ``query`` and
+            ``fragment`` attributes.
         .. _section 3.2.1: https://tools.ietf.org/html/rfc3986#section-3.2.1
         """
         scheme = self.scheme
