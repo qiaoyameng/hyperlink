@@ -554,6 +554,250 @@ class TestURL(HyperlinkTestCase):
                 ),
             )
 
+    def _assertRelativeRoundtrip(self, target, base):
+        # type: (URL, URL) -> None
+        reference = target.relative_to(base)
+        self.assertEqual(base.click(reference), target)
+        self.assertEqual(
+            base.click(reference.to_text()).to_uri(), target.to_uri()
+        )
+
+    def test_relativeToRFC3986(self):
+        # type: () -> None
+        """
+        L{URL.relative_to} should be the inverse of L{URL.click} for the
+        RFC 3986 section 5.4 reference resolution examples.
+        """
+        base = URL.from_text(relativeLinkBaseForRFC3986)
+        for (ref, expected) in relativeLinkTestsForRFC3986:
+            target = base.click(ref)
+            self.assertEqual(target.to_text(), expected)
+            self._assertRelativeRoundtrip(target, base)
+
+    def test_relativeToReference(self):
+        # type: () -> None
+        """
+        L{URL.relative_to} should render the documented reference forms
+        for query, fragment, and path differences.
+        """
+        base = URL.from_text("http://example.com/a/b/c?q=1")
+        cases = [
+            # same path, different query
+            ("http://example.com/a/b/c?q=2", "?q=2"),
+            # same path and query, fragment only
+            ("http://example.com/a/b/c?q=1#frag", "?q=1#frag"),
+            # same path but target drops the base query, fragment only
+            ("http://example.com/a/b/c#frag", "c#frag"),
+            # sibling path
+            ("http://example.com/a/b/g", "g"),
+            # directory target
+            ("http://example.com/a/b/g/", "g/"),
+            # target above the base path
+            ("http://example.com/a/d", "../d"),
+            ("http://example.com/d", "../../d"),
+            # root target
+            ("http://example.com/", "../../"),
+        ]
+        for target_text, expected_ref in cases:
+            target = URL.from_text(target_text)
+            self.assertEqual(
+                target.relative_to(base).to_text(),
+                expected_ref,
+                (target_text, expected_ref),
+            )
+            self._assertRelativeRoundtrip(target, base)
+
+    def test_relativeToEmptyQueryAndFragment(self):
+        # type: () -> None
+        """
+        L{URL.relative_to} should clear the base query with a
+        path-bearing reference, and keep empty fragments distinct.
+        """
+        # Empty query and empty fragment are not representable
+        # separately from their absence, but the reachable
+        # distinctions roundtrip exactly.
+        cases = [
+            # (base, target, expected reference text)
+            ("http://example.com/a/b/c?q=1", "http://example.com/a/b/c", "c"),
+            (
+                "http://example.com/a/b/c/?q=1",
+                "http://example.com/a/b/c/",
+                "./",
+            ),
+            ("http://example.com/a/?q=1", "http://example.com/a/", "./"),
+            ("http://example.com/a?q=1", "http://example.com/a", "a"),
+            ("http://example.com/a/b/c", "http://example.com/a/b/c", ""),
+            (
+                "http://example.com/a/b/c",
+                "http://example.com/a/b/c#f",
+                "#f",
+            ),
+        ]
+        for base_text, target_text, expected_ref in cases:
+            base = URL.from_text(base_text)
+            target = URL.from_text(target_text)
+            reference = target.relative_to(base)
+            self.assertEqual(
+                reference.to_text(),
+                expected_ref,
+                (base_text, target_text),
+            )
+            self.assertEqual(base.click(reference), target)
+            self.assertEqual(
+                base.click(reference.to_text()), target
+            )
+
+    def test_relativeToTrailingSlash(self):
+        # type: () -> None
+        """
+        L{URL.relative_to} should preserve directory trailing slashes,
+        including repeated empty segments.
+        """
+        cases = [
+            ("http://example.com/a/b/c/", "http://example.com/a/b/c/", ""),
+            ("http://example.com/a/b/c/d", "http://example.com/a/b/c/", "./"),
+            (
+                "http://example.com/a/b/c/d",
+                "http://example.com/a/b/c//",
+                ".//",
+            ),
+            (
+                "http://example.com/a/b/c/",
+                "http://example.com/a/b/c//",
+                ".//",
+            ),
+        ]
+        for base_text, target_text, expected_ref in cases:
+            base = URL.from_text(base_text)
+            target = URL.from_text(target_text)
+            reference = target.relative_to(base)
+            self.assertEqual(
+                reference.to_text(),
+                expected_ref,
+                (base_text, target_text),
+            )
+            self._assertRelativeRoundtrip(target, base)
+
+    def test_relativeToColonFirstSegment(self):
+        # type: () -> None
+        """
+        A colon in the first relative path segment must be protected by
+        a leading './' so the reference is not parsed as a scheme.
+        """
+        base = URL.from_text("http://example.com/a/b/c")
+        cases = [
+            ("http://example.com/a/b/g:h", "./g:h"),
+            ("http://example.com/a/b/g:h/i", "./g:h/i"),
+            # colons in later segments do not need the prefix
+            ("http://example.com/a/b/c/d:e", "c/d:e"),
+        ]
+        for target_text, expected_ref in cases:
+            target = URL.from_text(target_text)
+            reference = target.relative_to(base)
+            self.assertEqual(reference.to_text(), expected_ref)
+            self._assertRelativeRoundtrip(target, base)
+
+    def test_relativeToEncodedStructure(self):
+        # type: () -> None
+        """
+        Percent-encoded slashes and dots must remain data instead of
+        being treated as path structure.
+        """
+        base = URL.from_text("http://example.com/a/b/c")
+        cases = [
+            ("http://example.com/a/b/foo%2Fbar", "foo%2Fbar"),
+            ("http://example.com/a/b/a%2Fb/c", "a%2Fb/c"),
+            ("http://example.com/a/b/%2E%2E", "%2E%2E"),
+            ("http://example.com/a/b/%2e", "%2e"),
+        ]
+        for target_text, expected_ref in cases:
+            target = URL.from_text(target_text)
+            reference = target.relative_to(base)
+            self.assertEqual(reference.to_text(), expected_ref)
+            self.assertEqual(base.click(reference), target)
+            self.assertEqual(base.click(reference.to_text()), target)
+            # the encoded segment must stay a single segment
+            self.assertEqual(base.click(reference).path, target.path)
+
+    def test_relativeToDifferentOrigin(self):
+        # type: () -> None
+        """
+        Different scheme or authority must fall back to an absolute
+        reference, which still resolves correctly.
+        """
+        base = URL.from_text("http://example.com/a/b/c")
+        targets = [
+            "https://example.com/a/b/c",
+            "http://other.example.com/a/b/c",
+            "http://example.com:8080/a/b/c",
+            "http://user@example.com/a/b/c",
+        ]
+        for target_text in targets:
+            target = URL.from_text(target_text)
+            reference = target.relative_to(base)
+            self.assertIs(reference, target)
+            self.assertEqual(reference.to_text(), target_text)
+            self.assertEqual(base.click(reference), target)
+
+    def test_relativeToPrefixPath(self):
+        # type: () -> None
+        """
+        A target whose path is a strict prefix of the base path needs
+        an absolute-path reference rather than '.'/'..' semantics.
+        """
+        cases = [
+            ("http://example.com/a/b/c", "http://example.com/a/b", "/a/b"),
+            ("http://example.com/a/b/c", "http://example.com/a", "/a"),
+        ]
+        for base_text, target_text, expected_ref in cases:
+            base = URL.from_text(base_text)
+            target = URL.from_text(target_text)
+            reference = target.relative_to(base)
+            self.assertEqual(reference.to_text(), expected_ref)
+            self._assertRelativeRoundtrip(target, base)
+
+    def test_relativeToUnicode(self):
+        # type: () -> None
+        """
+        Unicode path segments should roundtrip through the reference,
+        with IRI/URI spelling compared via to_uri().
+        """
+        base = URL.from_text("http://example.com/a/b/c")
+        target = URL.from_text("http://example.com/a/b/tëst")
+        reference = target.relative_to(base)
+        self.assertEqual(base.click(reference), target)
+        self.assertEqual(
+            base.click(reference.to_text()).to_uri(), target.to_uri()
+        )
+        target2 = URL.from_text("http://example.com/a/b/日本語/x")
+        reference2 = target2.relative_to(base)
+        self.assertEqual(
+            base.click(reference2.to_text()).to_uri(), target2.to_uri()
+        )
+
+    def test_relativeToRootlessFallback(self):
+        # type: () -> None
+        """
+        A rootless empty-path target that no supported reference can
+        reach should fall back to the target itself instead of raising.
+        """
+        base = URL.from_text("a/b/c")
+        target = URL(path=(), rooted=False)
+        self.assertIs(target.relative_to(base), target)
+        # other rootless cases still produce working references
+        sibling = URL.from_text("a/b/g")
+        reference = sibling.relative_to(base)
+        self.assertEqual(reference.to_text(), "g")
+        self.assertEqual(base.click(reference), sibling)
+
+    def test_relativeToTypeCheck(self):
+        # type: () -> None
+        """
+        L{URL.relative_to} only accepts URL bases.
+        """
+        target = URL.from_text("http://example.com/a/b/c")
+        self.assertRaises(TypeError, target.relative_to, "http://example.com/")
+
     def test_queryAdd(self):
         # type: () -> None
         """

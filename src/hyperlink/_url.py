@@ -1645,6 +1645,170 @@ class URL(object):
             fragment=clicked.fragment,
         )
 
+    def relative_to(self, base):
+        # type: (URL) -> URL
+        """Return a new :class:`URL` object representing a URI-reference
+        relative to *base*. The reference is the inverse of
+        :meth:`~hyperlink.URL.click()`: resolving it against *base*
+        yields this URL, and its text form resolves the same way::
+
+            >>> base = URL.from_text(u'http://example.com/a/b/c?x=1')
+            >>> target = URL.from_text(u'http://example.com/a/b/d?x=2#f')
+            >>> reference = target.relative_to(base)
+            >>> reference.to_text()
+            u'd?x=2#f'
+            >>> base.click(reference) == target
+            True
+            >>> base.click(reference.to_text()) == target
+            True
+
+        When the scheme or authority (host, port, and userinfo) of
+        *base* and this URL differ, no relative reference can bridge
+        them, so an absolute reference (this URL itself) is returned.
+        For same-origin URLs the reference is chosen by the following
+        deterministic rules, rather than by attempting to find the
+        shortest possible string:
+
+        * Paths are compared segment by segment, on their encoded
+          form. Percent-encoded octets are never decoded, so encoded
+          slashes and dots (such as ``%2F`` and ``%2E``) stay data
+          instead of becoming path structure, and only a literal
+          segment equal to ``.`` or ``..`` affects resolution.
+        * When the paths differ, the reference walks up with ``..``
+          segments, one per base path segment that does not appear in
+          the target, then appends the remaining target segments.
+        * When the paths are equal, the reference has an empty path,
+          unless the target has no query while the base does. In that
+          case the last target path segment is used as the path (or
+          ``./`` when that segment is empty), so clicking the reference
+          clears the base's inherited query.
+        * A leading ``./`` is added when the first reference segment
+          would otherwise be empty or contain a colon (``:``), so the
+          reference cannot be mistaken for a rooted or
+          scheme-prefixed reference.
+        * If no relative-path reference can be proven to resolve back
+          to this URL, an absolute-path reference (starting with
+          ``/``) within the same origin is tried.
+        * If neither relative form resolves correctly, the absolute
+          reference (this URL itself) is returned instead. This is
+          only possible for authority-less URLs whose target has an
+          empty path.
+
+        The structure of neither URL is normalized, so distinctions
+        that normalization would erase are preserved.
+
+        The text form of the returned reference also resolves back to
+        this URL, compared with :meth:`~hyperlink.URL.to_uri()` so
+        that IRI and URI spellings of the same characters are
+        equivalent.
+
+        Args:
+            base: The :class:`URL` against which the returned
+                reference will be resolved.
+
+        Returns:
+            URL: A reference such that
+            ``base.click(reference) == self``.
+        """
+        _typecheck("base", base, URL)
+
+        origin = (
+            self.scheme,
+            self.host,
+            self.port,
+            self.userinfo,
+            self.uses_netloc,
+        )
+        base_origin = (
+            base.scheme,
+            base.host,
+            base.port,
+            base.userinfo,
+            base.uses_netloc,
+        )
+        if origin != base_origin:
+            return self
+
+        base_path = base.path
+        target_path = self.path
+
+        if target_path != base_path:
+            common = 0
+            common_limit = min(len(base_path) - 1, len(target_path))
+            while (
+                common < common_limit
+                and base_path[common] == target_path[common]
+            ):
+                common += 1
+            reference_path = (u"..",) * (
+                len(base_path) - 1 - common
+            ) + target_path[common:]
+            if not reference_path:
+                reference_path = (u".", u"")
+        else:
+            reference_path = ()
+            if not self.query and base.query:
+                # An empty-path reference inherits the base's query;
+                # use a path-bearing reference to clear it instead.
+                if target_path and target_path[-1] == u"":
+                    reference_path = (u".", u"")
+                elif target_path in _ROOT_PATHS:
+                    reference_path = (u".",)
+                else:
+                    reference_path = (target_path[-1],)
+
+        # An empty leading segment would render as a rooted reference
+        # (starting with '/'); prefix './' to keep it relative.
+        if reference_path and reference_path[0] == u"":
+            reference_path = (u".",) + reference_path
+        # RFC 3986 section 4.2: the first segment of a relative-path
+        # reference may not contain a colon.
+        if reference_path and reference_path[0] and u":" in reference_path[0]:
+            reference_path = (u".",) + reference_path
+
+        candidates = [
+            # Prefer a relative-path reference.
+            (reference_path, False),
+            # Fall back to an absolute-path reference within the same
+            # origin for targets that a relative path cannot express
+            # (for example, a target that is a strict prefix of the
+            # base path without a trailing slash).
+            (tuple(target_path), True),
+        ]
+
+        for candidate_path, rooted in candidates:
+            reference = self.replace(
+                scheme=u"",
+                host=u"",
+                path=candidate_path,
+                query=self.query,
+                fragment=self.fragment,
+                port=None,
+                rooted=rooted,
+                userinfo=u"",
+                uses_netloc=False,
+            )
+            # Verify the inverse relationship under both the structured
+            # click and the serialized-then-parsed click. Comparison is
+            # done after to_uri(), which makes IRI and URI spellings of
+            # the same characters equivalent without resolving
+            # percent-encoded structure such as "%2F" or "%2E". Some
+            # rootless (authority-less) URL shapes cannot be reached by
+            # any reference supported by click(), in which case the
+            # absolute reference is returned.
+            try:
+                if base.click(reference).to_uri() != self.to_uri():
+                    continue
+                if (
+                    base.click(reference.to_text()).to_uri()
+                    != self.to_uri()
+                ):
+                    continue
+            except (URLParseError, NotImplementedError):
+                continue
+            return reference
+        return self
+
     def to_uri(self):
         # type: () -> URL
         u"""Make a new :class:`URL` instance with all non-ASCII characters
@@ -2107,6 +2271,31 @@ class DecodedURL(object):
         return self._clone(
             self._url.click(href=href),
         )
+
+    def relative_to(self, base):
+        # type: (DecodedURL) -> DecodedURL
+        """Return a new :class:`DecodedURL` wrapping the result of
+        :meth:`hyperlink.URL.relative_to()`.
+
+        Like :meth:`hyperlink.URL.relative_to()`, the returned
+        reference resolves back to this URL when clicked from *base*::
+
+            >>> base = DecodedURL.from_text(u'http://example.com/a/b/c')
+            >>> target = DecodedURL.from_text(u'http://example.com/a/b/tëst')
+            >>> reference = target.relative_to(base)
+            >>> base.click(reference) == target
+            True
+
+        Args:
+            base: The :class:`DecodedURL` against which the returned
+                reference will be resolved.
+
+        Returns:
+            DecodedURL: A reference such that
+            ``base.click(reference) == self``.
+        """
+        _typecheck("base", base, DecodedURL)
+        return self._clone(self._url.relative_to(base._url))
 
     def sibling(self, segment):
         # type: (Text) -> DecodedURL

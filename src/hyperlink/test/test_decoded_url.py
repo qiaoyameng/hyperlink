@@ -239,6 +239,61 @@ class TestURL(HyperlinkTestCase):
         assert clicked.path == durl_dest.path
         assert clicked.path == ("tëst",)
 
+    def test_relative_to_decoded(self):
+        # type: () -> None
+        """
+        DecodedURL.relative_to returns a DecodedURL reference that
+        resolves back to the target, preserving decoded structure.
+        """
+        base = DecodedURL.from_text("http://example.com/a/b/c?q=1")
+        targets = [
+            "http://example.com/a/b/tëst",
+            "http://example.com/a/b/日本語/x",
+            "http://example.com/a/b/c?q=1#frég",
+            "http://example.com/a/b/c?x=日本",
+            # decoded slash stays part of a single path segment
+            "http://example.com/a/b/të%2Fst",
+            # encoded dots stay data
+            "http://example.com/a/b/%2E%2E",
+        ]
+        for target_text in targets:
+            target = DecodedURL.from_text(target_text)
+            reference = target.relative_to(base)
+            assert isinstance(reference, DecodedURL)
+            assert base.click(reference) == target
+            assert base.click(reference.to_text()) == target
+
+    def test_relative_to_decoded_query_fragment(self):
+        # type: () -> None
+        """
+        DecodedURL.relative_to renders the documented reference forms
+        for query and fragment differences.
+        """
+        base = DecodedURL.from_text("http://example.com/a/b/c?q=1")
+        cases = [
+            ("http://example.com/a/b/c?q=2", "?q=2"),
+            ("http://example.com/a/b/c?q=1#f", "?q=1#f"),
+            ("http://example.com/a/b/c", "c"),
+            ("http://example.com/a/b/c/", "c/"),
+        ]
+        for target_text, expected_ref in cases:
+            target = DecodedURL.from_text(target_text)
+            reference = target.relative_to(base)
+            assert reference.to_text() == expected_ref
+            assert base.click(reference) == target
+            assert base.click(reference.to_text()) == target
+
+    def test_relative_to_decoded_type_check(self):
+        # type: () -> None
+        """
+        DecodedURL.relative_to only accepts DecodedURL bases.
+        """
+        target = DecodedURL.from_text("http://example.com/a/b/c")
+        with self.assertRaises(TypeError):
+            target.relative_to("http://example.com/")
+        with self.assertRaises(TypeError):
+            target.relative_to(URL.from_text("http://example.com/"))
+
     def test_decode_plus(self):
         # type: () -> None
         durl = DecodedURL.from_text("/x+y%2B?a=b+c%2B")

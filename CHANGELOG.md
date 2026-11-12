@@ -3,6 +3,9 @@
 ## Next
 
 * CPython 3.9 added to test matrix
+* `URL.relative_to()` and `DecodedURL.relative_to()` added, the inverse
+  of `click()`, producing a reference that resolves back to the target
+  without normalizing either URL.
 
 ## 21.0.0
 

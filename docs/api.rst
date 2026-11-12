@@ -65,6 +65,7 @@ Go places with URLs. Simulate browser behavior and perform semantic
 path operations.
 
 .. automethod:: hyperlink.URL.click
+.. automethod:: hyperlink.URL.relative_to
 .. automethod:: hyperlink.URL.sibling
 .. automethod:: hyperlink.URL.child
 
