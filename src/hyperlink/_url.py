@@ -47,7 +47,7 @@ from typing import (
     overload,
 )
 from unicodedata import normalize
-from ._socket import inet_pton
+from ._socket import inet_pton, inet_ntop
 
 try:
     from collections.abc import Mapping as MappingABC
@@ -912,6 +912,241 @@ def parse_host(host):
     return family, host
 
 
+def _normalize_origin_host(host):
+    # type: (Text) -> Text
+    """Canonicalize a host for origin comparison. This is the
+    normalization basis recorded by every tuple :class:`Origin`:
+
+    * Domain names are IDNA/UTS#46-encoded to their ASCII (A-label)
+      form and lowercased, so that Unicode (U-label) and punycode
+      (A-label) spellings of the same name compare equal.
+    * IPv6 addresses are normalized through
+      :func:`~socket.inet_pton`/:func:`~socket.inet_ntop`, so that
+      equivalent spellings (e.g. ``::1`` and ``0:0:0:0:0:0:0:1``)
+      compare equal.
+    * IPv4 addresses are already canonical dotted quads (see
+      :func:`parse_host`) and are kept as-is.
+
+    No DNS resolution is performed; normalization is purely textual.
+    """
+    family, _ = parse_host(host)
+    if family == AF_INET6:
+        return inet_ntop(AF_INET6, inet_pton(AF_INET6, host))
+    if family == AF_INET:
+        return host
+    try:
+        return idna_encode(host, uts46=True).decode("ascii").lower()
+    except (ValueError, UnicodeError):
+        # Not encodable as IDNA (e.g. contains characters outside any
+        # label). Fall back to case folding so the origin remains
+        # deterministic and comparable.
+        return host.lower()
+
+
+class Origin(object):
+    u"""An immutable value object representing the *origin* of a URL,
+    suitable for same-origin checks in crawlers and other collection
+    systems. Access it via :attr:`URL.origin` (or
+    :attr:`DecodedURL.origin`) and compare URLs with
+    :meth:`URL.same_origin`.
+
+    Two kinds of origins exist, following an explicit policy:
+
+    * **Tuple origins** carry ``(scheme, host, port)``. Any URL with a
+      host gets a tuple origin. The host is normalized per
+      :func:`_normalize_origin_host` (IDNA/UTS#46 for domains,
+      inet_ntop canonical form for IPv6), and the port is the
+      *effective* port: the explicit port if present, otherwise the
+      scheme's default port from :data:`SCHEME_PORT_MAP`. This makes
+      ``http://example.com`` and ``http://example.com:80`` equal, as
+      well as ``http://bücher.de`` and ``http://xn--bcher-kva.de``.
+    * **Opaque origins** are used for URLs without a host (e.g.
+      ``mailto:``, ``data:``, ``urn:``, or ``file:`` URLs without an
+      authority). An opaque origin is tagged with its (lowercased)
+      scheme, so two opaque origins are equal only when their schemes
+      match. Hostless URLs are *not* all lumped into a single empty
+      origin: ``mailto:a@b`` and ``data:text/plain,x`` have different
+      origins.
+
+    Relative URLs (no scheme) have no origin; accessing
+    :attr:`URL.origin` on one raises :class:`URLParseError`.
+
+    ``userinfo``, ``path``, ``query``, and ``fragment`` never take
+    part in an origin, and computing an origin never mutates the
+    source URL. Origins are hashable and serializable:
+    ``Origin.from_text(origin.to_text()) == origin``, and comparison
+    behavior is preserved across the round trip.
+
+    .. versionadded:: 21.1.0
+    """
+
+    __slots__ = ("_scheme", "_host", "_port", "_opaque")
+
+    def __init__(self, scheme, host, port=None):
+        # type: (Text, Text, Optional[int]) -> None
+        """Create a tuple origin from *scheme*, *host*, and *port*.
+        The host is normalized (see :class:`Origin` for the rules) and
+        a missing port defaults to the scheme's registered default
+        port, if any.
+        """
+        scheme = _textcheck("scheme", scheme).lower()
+        if not scheme:
+            raise ValueError("origin requires a scheme, not: %r" % (scheme,))
+        host = _textcheck("host", host)
+        if not host:
+            raise ValueError(
+                "tuple origin requires a host; use Origin.opaque()"
+                " for hostless origins"
+            )
+        self._scheme = scheme
+        self._host = _normalize_origin_host(host)
+        if port is None:
+            port = SCHEME_PORT_MAP.get(scheme)
+        self._port = _typecheck("port", port, int, NoneType)
+        self._opaque = False
+
+    @classmethod
+    def opaque(cls, scheme):
+        # type: (Text) -> Origin
+        """Create an opaque origin tagged with *scheme*. Opaque origins
+        compare equal only to opaque origins with the same scheme tag.
+        """
+        self = cls.__new__(cls)
+        scheme = _textcheck("scheme", scheme).lower()
+        if not scheme:
+            raise ValueError(
+                "opaque origin requires a scheme tag, not: %r" % (scheme,)
+            )
+        self._scheme = scheme
+        self._host = None  # type: Optional[Text]
+        self._port = None  # type: Optional[int]
+        self._opaque = True
+        return self
+
+    @property
+    def scheme(self):
+        # type: () -> Text
+        """The lowercased scheme of this origin."""
+        return self._scheme
+
+    @property
+    def host(self):
+        # type: () -> Optional[Text]
+        """The normalized host of a tuple origin, or ``None`` for
+        opaque origins. The normalization applied is the comparison
+        basis: IDNA/UTS#46 A-labels for domains, canonical
+        :func:`~socket.inet_ntop` form for IPv6.
+        """
+        return self._host
+
+    @property
+    def port(self):
+        # type: () -> Optional[int]
+        """The effective port of a tuple origin (explicit or scheme
+        default), or ``None`` for opaque origins and schemes without a
+        known default port.
+        """
+        return self._port
+
+    @property
+    def is_opaque(self):
+        # type: () -> bool
+        """Whether this is an opaque origin (see :class:`Origin`)."""
+        return self._opaque
+
+    def to_text(self):
+        # type: () -> Text
+        """Serialize this origin to text, such that
+        ``Origin.from_text(origin.to_text()) == origin``.
+
+        Tuple origins serialize as ``scheme://host:port`` (IPv6 hosts
+        are bracketed, a missing port is omitted). Opaque origins
+        serialize as ``opaque:<scheme>``.
+        """
+        if self._opaque:
+            return u"opaque:" + self._scheme
+        host = cast(Text, self._host)
+        if u":" in host:
+            host = u"[" + host + u"]"
+        ret = self._scheme + u"://" + host
+        if self._port is not None:
+            ret += u":" + Text(self._port)
+        return ret
+
+    @classmethod
+    def from_text(cls, text):
+        # type: (Text) -> Origin
+        """Deserialize an origin serialized with :meth:`to_text`. The
+        host is normalized with the same rules as the constructor, so
+        origins restored from text compare exactly like the originals.
+        """
+        text = _textcheck("text", text)
+        if text.startswith(u"opaque:"):
+            return cls.opaque(text[len(u"opaque:") :])
+        scheme, sep, authority = text.partition(u"://")
+        if not sep or not scheme or not authority:
+            raise URLParseError("invalid origin text: %r" % (text,))
+        host = authority
+        port = None  # type: Optional[int]
+        if host.startswith(u"["):
+            end = host.find(u"]")
+            if end == -1:
+                raise URLParseError("invalid IPv6 host in origin: %r" % text)
+            host, tail = authority[1:end], authority[end + 1 :]
+            if tail.startswith(u":"):
+                port = _parse_origin_port(tail[1:], text)
+            elif tail:
+                raise URLParseError("invalid authority in origin: %r" % text)
+        elif u":" in host:
+            host, _, port_text = host.rpartition(u":")
+            port = _parse_origin_port(port_text, text)
+        return cls(scheme, host, port)
+
+    def __eq__(self, other):
+        # type: (Any) -> bool
+        if not isinstance(other, Origin):
+            return NotImplemented
+        return (
+            self._opaque == other._opaque
+            and self._scheme == other._scheme
+            and self._host == other._host
+            and self._port == other._port
+        )
+
+    def __ne__(self, other):
+        # type: (Any) -> bool
+        if not isinstance(other, Origin):
+            return NotImplemented
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        # type: () -> int
+        return hash(
+            (Origin, self._opaque, self._scheme, self._host, self._port)
+        )
+
+    def __repr__(self):
+        # type: () -> str
+        if self._opaque:
+            return "Origin.opaque(%r)" % (self._scheme,)
+        return "Origin(scheme=%r, host=%r, port=%r)" % (
+            self._scheme,
+            self._host,
+            self._port,
+        )
+
+
+def _parse_origin_port(port_text, text):
+    # type: (Text, Text) -> int
+    try:
+        return int(port_text)
+    except ValueError:
+        raise URLParseError(
+            "expected integer for port in origin, not %r: %r"
+            % (port_text, text)
+        )
+
+
 class URL(object):
     r"""From blogs to billboards, URLs are so common, that it's easy to
     overlook their complexity and power. With hyperlink's
@@ -1287,6 +1522,64 @@ class URL(object):
         Absolute URLs must have both a scheme and a host set.
         """
         return bool(self.scheme and self.host)
+
+    @property
+    def origin(self):
+        # type: () -> Origin
+        """The :class:`Origin` of this URL, for same-origin comparisons.
+
+        The origin is computed from the scheme, host, and effective
+        port only; ``userinfo``, ``path``, ``query``, and ``fragment``
+        never take part, and computing the origin never mutates this
+        URL. See :class:`Origin` for the exact normalization and
+        opaque-origin policy.
+
+        >>> URL.from_text(u'http://example.com/a/b?x=1#frag').origin
+        Origin(scheme=u'http', host=u'example.com', port=80)
+        >>> URL.from_text(u'mailto:user@example.com').origin
+        Origin.opaque(u'mailto')
+
+        Raises:
+            URLParseError: if the URL has no scheme (e.g. relative
+                URLs), for which no origin is defined.
+
+        .. versionadded:: 21.1.0
+        """
+        if not self.scheme:
+            raise URLParseError(
+                "cannot determine the origin of a URL without a"
+                " scheme: %r" % (self.to_text(),)
+            )
+        if self.host:
+            return Origin(self.scheme, self.host, self.port)
+        return Origin.opaque(self.scheme)
+
+    def same_origin(self, other):
+        # type: (Union[URL, DecodedURL]) -> bool
+        """Whether this URL and *other* share the same :class:`Origin`.
+
+        Accepts both :class:`URL` and :class:`DecodedURL` instances.
+        Unlike :meth:`URL.__eq__`, this comparison normalizes the host
+        (IDNA, IPv6, case) and treats an omitted port as the scheme's
+        default port, while ignoring userinfo, path, query, and
+        fragment. The equality contract of :class:`URL` itself is
+        unchanged.
+
+        >>> url = URL.from_text(u'http://user@example.com:80/a?x=1')
+        >>> url.same_origin(URL.from_text(u'http://EXAMPLE.com/b#f'))
+        True
+        >>> url.same_origin(URL.from_text(u'https://example.com/a'))
+        False
+
+        .. versionadded:: 21.1.0
+        """
+        if isinstance(other, DecodedURL):
+            other = other._url
+        if not isinstance(other, URL):
+            raise TypeError(
+                "expected URL or DecodedURL, not: %r" % (other,)
+            )
+        return self.origin == other.origin
 
     def replace(
         self,
@@ -2153,6 +2446,26 @@ class DecodedURL(object):
     def absolute(self):
         # type: () -> bool
         return self._url.absolute
+
+    @property
+    def origin(self):
+        # type: () -> Origin
+        """Passthrough to :attr:`URL.origin` of the underlying
+        :class:`URL`. See :class:`Origin` for the comparison and
+        normalization policy.
+
+        .. versionadded:: 21.1.0
+        """
+        return self._url.origin
+
+    def same_origin(self, other):
+        # type: (Union[URL, DecodedURL]) -> bool
+        """Passthrough to :meth:`URL.same_origin`, accepting both
+        :class:`URL` and :class:`DecodedURL` instances.
+
+        .. versionadded:: 21.1.0
+        """
+        return self._url.same_origin(other)
 
     @property
     def scheme(self):

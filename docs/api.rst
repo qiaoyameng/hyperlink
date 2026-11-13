@@ -68,6 +68,24 @@ path operations.
 .. automethod:: hyperlink.URL.sibling
 .. automethod:: hyperlink.URL.child
 
+Origins
+-------
+
+Compare URLs by origin (scheme, normalized host, and effective port),
+for example when grouping collected URLs by source. Hosts are
+normalized with IDNA/UTS#46 (domains) and canonical IPv6 form, default
+ports are folded in, and hostless URLs get scheme-tagged opaque
+origins. See :class:`hyperlink.Origin` for the full policy.
+
+.. autoclass:: hyperlink.Origin
+.. automethod:: hyperlink.Origin.from_text
+.. automethod:: hyperlink.Origin.to_text
+.. automethod:: hyperlink.Origin.opaque
+.. autoattribute:: hyperlink.URL.origin
+.. automethod:: hyperlink.URL.same_origin
+.. autoattribute:: hyperlink.DecodedURL.origin
+.. automethod:: hyperlink.DecodedURL.same_origin
+
 Query Parameters
 ----------------
 

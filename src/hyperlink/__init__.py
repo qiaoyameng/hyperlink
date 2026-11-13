@@ -4,6 +4,7 @@ from ._url import (
     URL,
     EncodedURL,
     DecodedURL,
+    Origin,
     URLParseError,
 )
 
@@ -13,5 +14,6 @@ __all__ = (
     "URL",
     "EncodedURL",
     "DecodedURL",
+    "Origin",
     "URLParseError",
 )

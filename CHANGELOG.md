@@ -3,6 +3,14 @@
 ## Next
 
 * CPython 3.9 added to test matrix
+* Added `hyperlink.Origin`, an immutable origin value object, along with
+  `URL.origin`/`DecodedURL.origin` and `URL.same_origin()`/
+  `DecodedURL.same_origin()`. Origins compare scheme, normalized host
+  (IDNA/UTS#46 for domains, canonical form for IPv6), and effective
+  port (default ports folded in), ignoring userinfo, path, query, and
+  fragment. Hostless URLs get scheme-tagged opaque origins instead of
+  one shared empty origin, and origins round-trip through
+  `Origin.to_text()`/`Origin.from_text()`. `URL` equality is unchanged.
 
 ## 21.0.0
 
