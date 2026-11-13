@@ -3,6 +3,8 @@
 ## Next
 
 * CPython 3.9 added to test matrix
+* Add `URL.relative_to()` and `DecodedURL.relative_to()` for generating
+  same-origin relative references which resolve back to the target.
 
 ## 21.0.0
 

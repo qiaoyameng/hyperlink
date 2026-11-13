@@ -483,6 +483,113 @@ class TestURL(HyperlinkTestCase):
         for (ref, expected) in relativeLinkTestsForRFC3986:
             self.assertEqual(base.click(ref).to_text(), expected)
 
+    def test_relative_toRFC3986(self):
+        # type: () -> None
+        """
+        L{URL.relative_to} should invert RFC 3986 reference resolution.
+        """
+        base = URL.from_text(relativeLinkBaseForRFC3986)
+        for (reference, expected) in relativeLinkTestsForRFC3986:
+            target = base.click(reference)
+            relative = target.relative_to(base)
+            self.assertEqual(base.click(relative), target)
+            self.assertEqual(base.click(relative.to_text()), target)
+
+    def test_relative_toQueryAndFragment(self):
+        # type: () -> None
+        """
+        Empty queries and fragments are cleared by a reference which can
+        be reparsed from text.
+        """
+        tests = [
+            ("http://example.com/a/b?x=1", "http://example.com/a/b?x=2"),
+            ("http://example.com/a/b?x=1", "http://example.com/a/b"),
+            ("http://example.com/a/b?x=1#f", "http://example.com/a/b?x=1"),
+            ("http://example.com/a/b?x=1#f", "http://example.com/a/b"),
+            ("http://example.com/a/b#f", "http://example.com/a/b"),
+            ("http://example.com/a/b#f", "http://example.com/a/b#g"),
+        ]
+        for base_text, target_text in tests:
+            base = URL.from_text(base_text)
+            target = URL.from_text(target_text)
+            relative = target.relative_to(base)
+            self.assertEqual(base.click(relative), target)
+            self.assertEqual(base.click(relative.to_text()), target)
+
+    def test_relative_toDirectoryAndFirstSegmentColon(self):
+        # type: () -> None
+        """
+        Directory trailing slashes are preserved, and a colon in the
+        first relative segment cannot be parsed as a scheme.
+        """
+        tests = [
+            ("http://example.com/a/b/c", "http://example.com/a/b/"),
+            ("http://example.com/a/b/c/", "http://example.com/a/b/"),
+            ("http://example.com/x/y", "http://example.com/x/a:b"),
+            ("http://example.com/x/y", "http://example.com/a:b/c"),
+        ]
+        for base_text, target_text in tests:
+            base = URL.from_text(base_text)
+            target = URL.from_text(target_text)
+            relative = target.relative_to(base)
+            self.assertFalse(relative.absolute)
+            self.assertEqual(base.click(relative), target)
+            self.assertEqual(base.click(relative.to_text()), target)
+
+    def test_relative_toEncodedPathSegments(self):
+        # type: () -> None
+        """
+        Encoded slashes and dots stay within their original segments.
+        """
+        base = URL.from_text("http://example.com/a/b")
+        target = URL.from_text("http://example.com/a/x%2Fy/d%2Ee")
+        relative = target.relative_to(base)
+        self.assertEqual(relative.path, ("x%2Fy", "d%2Ee"))
+        self.assertEqual(base.click(relative), target)
+        self.assertEqual(base.click(relative.to_text()), target)
+
+    def test_relative_toUnicode(self):
+        # type: () -> None
+        """
+        Unicode paths round trip through relative references and text.
+        """
+        base = URL.from_text("https://例え.テスト/資料/一覧?x=1#top")
+        target = URL.from_text("https://例え.テスト/資料/新しい 文書?q=値#節")
+        relative = target.relative_to(base)
+        self.assertFalse(relative.absolute)
+        self.assertEqual(base.click(relative), target)
+        self.assertEqual(base.click(relative.to_text()), target)
+
+    def test_relative_toOtherAuthority(self):
+        # type: () -> None
+        """
+        A different scheme or authority falls back to the absolute target.
+        """
+        base = URL.from_text("http://example.com/a")
+        for target_text in [
+            "https://example.com/a",
+            "http://other.example.com/a",
+            "http://example.com:8080/a",
+        ]:
+            target = URL.from_text(target_text)
+            relative = target.relative_to(base)
+            self.assertTrue(relative.absolute)
+            self.assertEqual(relative, target)
+            self.assertEqual(base.click(relative), target)
+
+    def test_relative_toLiteralDots(self):
+        # type: () -> None
+        """
+        Literal dot segments are preserved by falling back to an absolute
+        reference rather than normalizing the target.
+        """
+        base = URL.from_text("http://example.com/a/b")
+        target = URL.from_text("http://example.com/a/./b")
+        relative = target.relative_to(base)
+        self.assertEqual(relative, target)
+        self.assertEqual(base.click(relative), target)
+        self.assertEqual(base.click(relative).path, target.path)
+
     def test_clickSchemeRelPath(self):
         # type: () -> None
         """

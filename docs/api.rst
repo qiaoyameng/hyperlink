@@ -65,8 +65,15 @@ Go places with URLs. Simulate browser behavior and perform semantic
 path operations.
 
 .. automethod:: hyperlink.URL.click
+.. automethod:: hyperlink.URL.relative_to
 .. automethod:: hyperlink.URL.sibling
 .. automethod:: hyperlink.URL.child
+
+The decoded URL has the same navigation methods, returning
+:class:`~hyperlink.DecodedURL` instances:
+
+.. automethod:: hyperlink.DecodedURL.click
+.. automethod:: hyperlink.DecodedURL.relative_to
 
 Query Parameters
 ----------------

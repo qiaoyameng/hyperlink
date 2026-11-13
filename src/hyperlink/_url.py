@@ -333,7 +333,9 @@ def _encode_path_parts(
             for part in text_parts
         ]
     else:
-        encoded_parts = [_encode_schemeless_path_part(text_parts[0])]
+        encoded_parts = [
+            _encode_schemeless_path_part(text_parts[0], maximal=maximal)
+        ]
         encoded_parts.extend(
             [
                 _encode_path_part(part, maximal=maximal) if part else part
@@ -868,6 +870,61 @@ def _resolve_dot_segments(path):
         segs.append(u"")
 
     return segs
+
+
+def _has_dot_segments(path):
+    # type: (Sequence[Text]) -> bool
+    return any(segment in (u".", u"..") for segment in path)
+
+
+def _relative_path_parts(
+    base_dir,  # type: Sequence[Text]
+    target_path,  # type: Sequence[Text]
+):
+    # type: (...) -> Optional[Tuple[Text, ...]]
+    """Compute rootless reference path parts from *base_dir* to
+    *target_path*, or return ``None`` when a rootless reference cannot
+    express the target exactly.
+    """
+    common = 0
+    common_limit = min(len(base_dir), len(target_path))
+    while common < common_limit and base_dir[common] == target_path[common]:
+        common += 1
+
+    if common == len(target_path) and common < len(base_dir):
+        return None
+
+    parts = [u".."] * (len(base_dir) - common)
+    parts.extend(target_path[common:])
+    if not parts:
+        return None
+    if parts == [u""]:
+        parts = [u".", u""]
+    elif parts[0] == u"":
+        parts.insert(0, u".")
+    return tuple(parts)
+
+
+def _absolute_path_reference_path(path):
+    # type: (Sequence[Text]) -> Text
+    parts = tuple(path)
+    if parts and parts[0] == u"":
+        parts = (u".",) + parts
+    if not parts:
+        return u"/"
+    return u"/" + u"/".join(parts)
+
+
+def _rootless_path_reference_path(path):
+    # type: (Sequence[Text]) -> Text
+    parts = tuple(path)
+    if not parts:
+        return u""
+    if parts[0] == u"":
+        parts = (u".",) + parts
+    if u":" in parts[0]:
+        parts = (u".",) + parts
+    return u"/".join(parts)
 
 
 def parse_host(host):
@@ -1564,6 +1621,116 @@ class URL(object):
         new_path += tuple(_encode_path_parts(segments, maximal=False))
         return self.replace(path=new_path)
 
+    def relative_to(self, base):
+        # type: (Union[Text, URL]) -> URL
+        """Return a reference which, when clicked from *base*, resolves to
+        this URL.
+
+        The result is a :class:`URL` whose ``to_text()`` is a relative
+        reference whenever this URL has the same scheme and authority as
+        *base*.  In particular, ``base.click(target.relative_to(base))``
+        has the same scheme, authority, path, query, and fragment as this
+        URL.
+
+        Path segments are compared and emitted without decoding or
+        normalization.  In particular, percent-encoded slashes and dots
+        remain ordinary path segments.  A leading colon in the first
+        emitted segment is protected with a ``./`` prefix, so the result
+        cannot be mistaken for a scheme.
+
+        The reference path is chosen relative to the directory of
+        *base* when that is expressible.  Root-relative paths are used
+        when a rootless path would be ambiguous, such as an ancestor
+        path without a trailing slash.  A network-path reference
+        (``//authority``) preserves an empty root path.  If the path
+        contains literal ``.`` or ``..`` segments, or if the scheme or
+        authority differs from *base*, this URL itself is returned as an
+        absolute reference.  This deterministic fallback is not
+        guaranteed to produce the shortest possible reference.
+
+        An empty query is represented by a non-empty path when it must
+        replace a non-empty query on *base*, because an empty query
+        cannot be distinguished from an absent query in URL text.  An
+        empty fragment likewise uses a non-empty path or query when it
+        must replace a fragment on *base*.
+
+        Args:
+            base: The absolute URL against which the reference is
+                resolved.  Text is parsed with :meth:`from_text`.
+
+        Returns:
+            URL: A reference resolvable with :meth:`click`.
+        """
+        if not isinstance(base, URL):
+            base = self.__class__.from_text(_textcheck("base", base))
+
+        same_authority = (
+            self.scheme == base.scheme
+            and self.host == base.host
+            and self.port == base.port
+            and self.userinfo == base.userinfo
+            and self.uses_netloc == base.uses_netloc
+        )
+        if not same_authority:
+            return self
+
+        target_path = tuple(self.path)
+        base_path = tuple(base.path)
+        if _has_dot_segments(target_path):
+            return self
+
+        force_path = (self.query == () and base.query != ()) or (
+            self.fragment == u"" and base.fragment != u""
+        )
+        path_text = u""
+        if not (
+            not force_path
+            and target_path == base_path
+            and self.rooted == base.rooted
+        ):
+            if target_path == () and self.rooted and self.host:
+                reference = self.__class__(
+                    scheme=u"",
+                    host=self.host,
+                    path=(),
+                    query=self.query,
+                    fragment=self.fragment,
+                    port=None,
+                    rooted=True,
+                    userinfo=self.userinfo,
+                    uses_netloc=True,
+                )
+                return reference
+
+            parts = None  # type: Optional[Tuple[Text, ...]]
+            if self.rooted:
+                if base.rooted and not _has_dot_segments(base_path[:-1]):
+                    parts = _relative_path_parts(
+                        base_path[:-1], target_path
+                    )
+                if parts is None:
+                    path_text = _absolute_path_reference_path(target_path)
+                else:
+                    path_text = _rootless_path_reference_path(parts)
+            elif not base.rooted:
+                if not _has_dot_segments(base_path[:-1]):
+                    parts = _relative_path_parts(
+                        base_path[:-1], target_path
+                    )
+                if parts is None:
+                    return self
+                path_text = _rootless_path_reference_path(parts)
+            else:
+                return self
+
+        reference = self.__class__.from_text(path_text)
+        reference_query = (
+            self.query if path_text or self.query != base.query else ()
+        )
+        return reference.replace(
+            query=reference_query, fragment=self.fragment
+        )
+
     def sibling(self, segment):
         # type: (Text) -> URL
         """Make a new :class:`URL` with a single path segment that is a
@@ -2107,6 +2274,24 @@ class DecodedURL(object):
         return self._clone(
             self._url.click(href=href),
         )
+
+    def relative_to(self, base):
+        # type: (Union[Text, URL, DecodedURL]) -> DecodedURL
+        """Return a :class:`DecodedURL` reference that resolves to this
+        URL when clicked from *base*.
+
+        This is the decoded counterpart to :meth:`URL.relative_to`.
+        The returned reference wraps the encoded reference produced by
+        :meth:`URL.relative_to`, so reserved characters in decoded path
+        segments remain data rather than path structure.
+        """
+        if isinstance(base, DecodedURL):
+            base_url = base._url
+        elif isinstance(base, URL):
+            base_url = base
+        else:
+            base_url = URL.from_text(_textcheck("base", base))
+        return self._clone(self._url.relative_to(base_url))
 
     def sibling(self, segment):
         # type: (Text) -> DecodedURL

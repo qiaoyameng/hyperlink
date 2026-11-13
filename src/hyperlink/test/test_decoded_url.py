@@ -239,6 +239,29 @@ class TestURL(HyperlinkTestCase):
         assert clicked.path == durl_dest.path
         assert clicked.path == ("tëst",)
 
+    def test_relative_to_decoded_url(self):
+        # type: () -> None
+        base = DecodedURL.from_text("https://例え.テスト/資料/一覧?x=1#top")
+        target = DecodedURL.from_text(
+            "https://例え.テスト/資料/新しい 文書?q=値#節"
+        )
+
+        relative = target.relative_to(base)
+
+        assert isinstance(relative, DecodedURL)
+        assert relative.path == ("新しい 文書",)
+        assert base.click(relative) == target
+        assert DecodedURL.from_text(relative.to_text()) == relative
+
+    def test_relative_to_decoded_encoded_segments(self):
+        base = DecodedURL.from_text("http://example.com/a/b")
+        target = DecodedURL.from_text("http://example.com/a/x%2Fy/d%2Ee")
+
+        relative = target.relative_to(base)
+
+        assert relative.path == ("x/y", "d.e")
+        assert base.click(relative) == target
+
     def test_decode_plus(self):
         # type: () -> None
         durl = DecodedURL.from_text("/x+y%2B?a=b+c%2B")
